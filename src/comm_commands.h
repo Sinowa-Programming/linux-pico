@@ -28,15 +28,23 @@ typedef struct __attribute__((packed)) {
 } CommunicationHeader;
 
 enum {
-    // Client commands( Commands for the program running though the PAL ).
+    /* Client commands( Commands for the program running though the PAL ). */
+
+    // Sets the client to a uint32_t address
     START_CLIENT = 0x1,
+    // Pauses the client task in FreeRTOS
     HALT_CLIENT = 0X2,
+    // Unpauses the client task in FreeRTOS
     RESUME_CLIENT = 0X3,
+
+    FILE_OPEN = 0x4,    // Get the file size.
+    FILE_CLOSE = 0x5,   // Closes the file handler.
+    FILE_READ = 0x6,    // Sends a page of data from swap side to the file buffer
+    FILE_WRITE = 0x7,   // Writes the page of data from the file buffer to the swap side
 
     PAGE_TABLE_ALLOC = 0xD,
     PAGE_TABLE_READ = 0xE,  // swap -> local page
     PAGE_TABLE_WRITE = 0xF   // local page -> swap
 };
-
 
 #endif  // COMM_COMMANDS_H
