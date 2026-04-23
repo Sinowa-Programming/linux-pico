@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <inttypes.h>   // For uint16_t printf
 
 #include "usb_handler.h"
 #include "file_functions.h"
@@ -375,21 +376,51 @@ void runListener() {
         r = libusb_bulk_transfer(dev_handle, EP_IN, 
                                     (unsigned char*)&header, sizeof(header), 
                                     &transferred, 0); // 0 = Infinite timeout (wait forever)
+        
+        printf("Header: {\nMCU_ID = \t%" PRIu8 ",\nCMD = \t%" PRIu8 ",\nSIZE = \t%" PRIu16 "}\n",
+                    header.mcu_id, header.cmd, header.data_length);
 
         if (r == 0 && transferred == sizeof(header)) {
-            
             // 2. Read the Payload (if data_length > 0)
             if (header.data_length > 0) {
-                uint8_t* payload = malloc(header.data_length);
-                
-                r = libusb_bulk_transfer(dev_handle, EP_IN, 
-                                            payload, header.data_length, 
-                                            &transferred, 1000); // 1s timeout for body
+                uint32_t expected = (uint32_t)header.data_length;
+                uint8_t* payload = malloc(expected);
+                if (!payload) {
+                    fprintf(stderr, "[Error] Failed to allocate %u bytes for payload\n", expected);
+                    continue;
+                }
 
-                if (r == 0 && transferred == header.data_length) {
+                uint32_t total_received = 0;
+                while (total_received < expected) {
+                    int to_read = (int)(expected - total_received);
+                    r = libusb_bulk_transfer(dev_handle, EP_IN,
+                                             payload + total_received,
+                                             to_read,
+                                             &transferred, 0); // 1s timeout per chunk
+
+                    if (r == 0 && transferred > 0) {
+                        total_received += (uint32_t)transferred;
+                        continue;
+                    }
+
+                    if (r == LIBUSB_ERROR_TIMEOUT) {
+                        fprintf(stderr, "[Error] Timeout while reading payload (%u/%u)\n", total_received, expected);
+                        break;
+                    }
+
+                    if (r == LIBUSB_ERROR_NO_DEVICE) {
+                        free(payload);
+                        return; // device disconnected
+                    }
+
+                    fprintf(stderr, "[Error] libusb_bulk_transfer failed while reading payload: %s\n", libusb_error_name(r));
+                    break;
+                }
+
+                if (total_received == expected) {
                     processPayload(&header, payload);
                 } else {
-                    fprintf(stderr, "[Error] Incomplete payload received. Expected %u, got %d\n", header.data_length, transferred);
+                    fprintf(stderr, "[Error] Incomplete payload received. Expected %u, got %u\n", expected, total_received);
                 }
                 free(payload);
             } else {
