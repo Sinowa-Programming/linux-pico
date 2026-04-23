@@ -194,7 +194,7 @@ bool start_client_program(uint32_t starting_addr)
 }
 
 void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
-    printf("[DEBUG] Header CMD RAW: raw=0x%08X", header->cmd);
+    printf("[DEBUG] Header CMD RAW: raw=0x%08X\n", header->cmd);
     switch(header->cmd) {
         case PAGE_TABLE_READ: {
             // Read 4 bytes for page identifier/virtual address
@@ -204,15 +204,30 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             int32_t pageIndex = translate_to_page_index(pageIdRaw);
             if (pageIndex >= 0) {
                 printf("[CMD] Read Request for page (raw=0x%08X -> idx=%d). Sending data...\n", pageIdRaw, pageIndex);
+                
+                CommunicationHeader tx_header = {
+                    .mcu_id = header->mcu_id,
+                    .cmd = PAGE_TABLE_WRITE,
+                    .data_length = 0    // Ignored on the mcu( for now )
+                };
 
+                uint32_t total_tx_size = sizeof(CommunicationHeader) + PAGE_SIZE;
+                uint8_t* tx_buffer = (uint8_t*)malloc(total_tx_size);
+                
+                memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
+                memcpy(tx_buffer + sizeof(CommunicationHeader), sram_frames[pageIndex], PAGE_SIZE);
+                
                 int sent_bytes;
                 int r = libusb_bulk_transfer(dev_handle, EP_OUT,
-                                            sram_frames[pageIndex], PAGE_SIZE,
-                                            &sent_bytes, 1000);
+                                            tx_buffer, total_tx_size,
+                                            &sent_bytes, 0);
 
                 if (r != 0) {
                     fprintf(stderr, "[Error] Failed to send page data.\n");
                 }
+                printf("[INFO] Transmission Complete. \n");
+
+                free(tx_buffer); // Free to prevent memory leaks
             } else {
                 fprintf(stderr, "[Error] Page identifier 0x%08X out of bounds.\n", pageIdRaw);
             }
@@ -252,15 +267,30 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             } else {
                 printf("[CMD] Allocated %u bytes starting at page %d (virtual 0x%08X)\n", requested_size, assigned_page_id, page_index_to_virtual(assigned_page_id));
 
-                // Send back the allocated virtual address to the client
+                // Send back the allocated virtual address to the client with header
                 uint32_t assigned_virtual = page_index_to_virtual((uint32_t)assigned_page_id);
+                
+                CommunicationHeader tx_header = {
+                    .mcu_id = header->mcu_id,
+                    .cmd = PAGE_TABLE_ALLOC,
+                    .data_length = 0    // Ignored on the mcu( for now )
+                };
+
+                uint32_t total_tx_size = sizeof(CommunicationHeader) + sizeof(assigned_virtual);
+                uint8_t* tx_buffer = (uint8_t*)malloc(total_tx_size);
+                
+                memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
+                memcpy(tx_buffer + sizeof(CommunicationHeader), &assigned_virtual, sizeof(assigned_virtual));
+
                 int sent_bytes;
                 int r = libusb_bulk_transfer(dev_handle, EP_OUT,
-                                            (unsigned char*)&assigned_virtual, sizeof(assigned_virtual),
-                                            &sent_bytes, 1000);
+                                            tx_buffer, total_tx_size,
+                                            &sent_bytes, 0);
                 if (r != 0) {
                     fprintf(stderr, "[Error] Failed to send allocated page ID.\n");
                 }
+                
+                free(tx_buffer);
             }
             break;
         }
@@ -275,21 +305,35 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             int32_t file_id = open_file(filename);
             printf("[CMD] FILE_OPEN: %s\n", filename);
             
-            // Send back the file ID
+            CommunicationHeader tx_header = {
+                .mcu_id = header->mcu_id,
+                .cmd = FILE_OPEN,
+                .data_length = 0    // Ignored on the mcu( for now )
+            };
+
+            // Send back the file ID with header
+            uint32_t total_tx_size = sizeof(CommunicationHeader) + sizeof(file_id);
+            uint8_t* tx_buffer = (uint8_t*)malloc(total_tx_size);
+            
+            memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
+            memcpy(tx_buffer + sizeof(CommunicationHeader), &file_id, sizeof(file_id));
+
             int sent_bytes;
             int r = libusb_bulk_transfer(dev_handle, EP_OUT, 
-                                        (unsigned char*)&file_id, sizeof(file_id), 
-                                        &sent_bytes, 1000);
+                                        tx_buffer, total_tx_size, 
+                                        &sent_bytes, 0);
             if (r != 0) {
                 fprintf(stderr, "[Error] Failed to send file ID.\n");
             }
+            
+            free(tx_buffer);
             break;
         }
         
         case FILE_CLOSE: {
             // Read the remote_file_id
-            uint32_t remote_file_id = 0;
-            memcpy(&remote_file_id, payload, sizeof(uint32_t));
+            int32_t remote_file_id = 0;
+            memcpy(&remote_file_id, payload, sizeof(int32_t));
             
             printf("[CMD] FILE_CLOSE: File ID %u\n", remote_file_id);
             close_file(remote_file_id);
@@ -309,29 +353,42 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             printf("[CMD] FILE_READ: offset=%u, length=%u, file_id=%u\n", 
                    file_read_header.file_offset, file_read_header.data_length, file_read_header.remote_file_id);
             
-            // Allocate temporary buffer for file read
-            uint8_t* read_buffer = malloc(file_read_header.data_length);
-            if (!read_buffer) {
+            CommunicationHeader tx_header = {
+                .mcu_id = header->mcu_id,
+                .cmd = FILE_OPEN,
+                .data_length = 0    // Ignored on the mcu( for now )
+            };
+
+            // Allocate one buffer to hold header + file data
+            uint32_t max_tx_size = sizeof(CommunicationHeader) + file_read_header.data_length;
+            uint8_t* tx_buffer = (uint8_t*)malloc(max_tx_size);
+            
+            if (!tx_buffer) {
                 fprintf(stderr, "[Error] Memory allocation failed for file read.\n");
                 break;
             }
             
+            // Read file directly into tx_buffer (offset by the header size)
             int32_t bytes_read = read_file(file_read_header.remote_file_id, 
                                           file_read_header.file_offset, 
                                           file_read_header.data_length, 
-                                          read_buffer);
+                                          tx_buffer + sizeof(CommunicationHeader));
             
             if (bytes_read > 0) {
-                // Send back the read data
+                // Prepend header to the successful file read
+                memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
+                uint32_t total_tx_size = sizeof(CommunicationHeader) + bytes_read;
+                
                 int sent_bytes;
                 int r = libusb_bulk_transfer(dev_handle, EP_OUT, 
-                                            read_buffer, bytes_read, 
-                                            &sent_bytes, 5000);
+                                            tx_buffer, total_tx_size, 
+                                            &sent_bytes, 0);
                 if (r != 0) {
                     fprintf(stderr, "[Error] Failed to send file data.\n");
                 }
             }
-            free(read_buffer);
+            
+            free(tx_buffer);
             break;
         }
         
@@ -362,7 +419,6 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             printf("[Error] Unknown command: 0x%02X\n", header->cmd);
     }
 }
-
 
 // Main processing loop
 void runListener() {
