@@ -5,47 +5,83 @@
 
 #include "memory_bitmap.h"
 
+
+
+// --- Constants & Memory ---
+#define VIRTUAL_MEMORY_SIZE (40 * 1024 * 1024)
+#define PAGE_SIZE 4096
+#define NUM_PAGES (VIRTUAL_MEMORY_SIZE / PAGE_SIZE)
+#define VIRTUAL_FILE_PAGE_SIZE 4096
+
+// Constant for the base address assigned in the linker script( in the pico code ).
+#define VIRTUAL_MEMORY_BASE 0x20082000
+
 /**
-    @brief Scans though the bitmap and returns the starting index of a page that is large enough for "count" amount of pages
+    @brief Scans through the bitmap and returns the starting virtual address of a block that is large enough for the requested size
     @param bitarr The bit array that is scanned
-    @param total_bits The size of the bit array
-    @param count The amount of pages/bits to be allocated
+    @param sizes_arr The parallel array used to store the size of each allocation
+    @param count The amount of pages to be allocated
+    @return The allocated page idx or -1 if out of memory
 */
-static int32_t allocate_pages(uint32_t* bitarr, uint32_t total_bits, uint32_t count) {
-    if (count == 0) return -1;
+static int32_t allocate_pages(uint32_t* bitarr, uint32_t* sizes_arr, uint32_t count) {
+    if (count == 0) return 0;
 
-    int32_t start_bit = 0;
+    int32_t page_idx = 0;
 
-    while (start_bit < total_bits) {
-        // 1. Find the next available zero
-        start_bit = find_next_zero(bitarr, total_bits, start_bit);
+    while (page_idx != -1 && (uint32_t)page_idx < NUM_PAGES) {
+        page_idx = find_next_zero(bitarr, NUM_PAGES, (uint32_t)page_idx);
         
         // If no zero found, or the remaining space is too small, we are out of memory
-        if (start_bit == -1 || start_bit + count > total_bits) {
-            return -1; 
+        if (page_idx == -1 || (uint32_t)page_idx + count > NUM_PAGES) {
+            return 0;
         }
 
-        // 2. Verify if the next 'count - 1' bits are ALSO zero
-        bool enough_space = true;
+        // Verify that the free block has enough space for our requested allocation block
         for (uint32_t i = 1; i < count; i++) {
-            if (get(bitarr, start_bit + i)) {
-                // Collision! We hit a used page.
-                start_bit = start_bit + i + 1;
-                enough_space = false;
-                break; 
+            if (get(bitarr, (uint32_t)page_idx + i)) {
+                page_idx = page_idx + i + 1;
+                continue; 
             }
         }
 
-        // 3. If we found a block, mark them all as used and return the index
-        if (enough_space) {
-            for (uint32_t i = 0; i < count; i++) {
-                set(bitarr, start_bit + i);
-            }
-            return start_bit;
+        // Allocate the block
+        for (uint32_t i = 0; i < count; i++) {
+            set(bitarr, (uint32_t)page_idx + i);
         }
+        
+        sizes_arr[page_idx] = count;
+        
+        // Translate the starting page index to a virtual address
+        return page_idx;
     }
 
-    return -1; // Memory is too fragmented to satisfy the request
+    return -1; // Memory is too fragmented
+}
+
+/**
+    @brief Frees a previously allocated contiguous block of pages based on its virtual address.
+    @param bitarr The bit array that is scanned
+    @param sizes_arr The parallel array storing the sizes of allocations
+    @param vaddr The starting virtual address of the pages to free
+*/
+static void free_pages(uint32_t* bitarr, uint32_t* sizes_arr, uint32_t vaddr) {
+    if (vaddr < VIRTUAL_MEMORY_BASE) {
+        return;
+    }
+
+    uint32_t page_idx = (vaddr - VIRTUAL_MEMORY_BASE) / PAGE_SIZE;
+
+    // Look up how many pages were originally allocated at this index
+    uint32_t count = sizes_arr[page_idx];
+    if (count == 0) return; // Nothing to free
+
+    // Clear the bits in the bitmap
+    for (uint32_t i = 0; i < count; i++) {
+        clear(bitarr, page_idx + i);
+    }
+    
+    // Clear the size metadata to prevent double-free issues
+    sizes_arr[page_idx] = 0; 
 }
 
 #endif  // PAGE_FUNCTIONS

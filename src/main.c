@@ -10,8 +10,11 @@
  .text.dav1dplay_main
                 0x0000000020082628      0x56c ../ported_programs/dav1d_pico_interface/libClient_program.a(dav1dplay.c.o)
                 0x0000000020082628                dav1dplay_main
-*/
+
+so the entry point is:
 #define CLIENT_PROGRAM_ENTRY_POINT 0x0000000020082628
+*/
+#define CLIENT_PROGRAM_ENTRY_POINT 0x000000002008207c
 
 int main(int argc, char* argv[]) {
     Start_Rp2350Host();

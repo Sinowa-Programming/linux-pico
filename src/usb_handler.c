@@ -10,16 +10,9 @@
 #include "file_functions.h"
 #include "client_program.h"
 
-// --- Constants & Memory ---
-#define VIRTUAL_MEMORY_SIZE (40 * 1024 * 1024)
-#define PAGE_SIZE 4096
-#define NUM_PAGES (VIRTUAL_MEMORY_SIZE / PAGE_SIZE)
-#define VIRTUAL_FILE_PAGE_SIZE 4096
-// Constant for the base address assigned in the linker script
-#define VIRTUAL_MEMORY_BASE 0x20082000
-
 
 uint8_t sram_frames[NUM_PAGES][PAGE_SIZE];
+uint32_t sizes_arr[NUM_PAGES] = {0};
 
 /* === Memory Objects === */
 uint32_t sram_bitmap[(NUM_PAGES + 31) / 32] = {0};
@@ -36,21 +29,12 @@ const int EP_IN = 0x81;  // Device -> Host
 libusb_context *ctx = NULL;
 libusb_device_handle *dev_handle = NULL;
 
-// Helper: translate a device-supplied page identifier (could be a virtual address
-// starting at VIRTUAL_MEMORY_BASE or a plain page index) into a zero-based
-// page index into `sram_frames`.
-static int32_t translate_to_page_index(uint32_t page_id_or_vaddr) {
-    // If the client sent a virtual address, translate it to page index.
-    if (page_id_or_vaddr >= VIRTUAL_MEMORY_BASE) {
-        uint32_t offset = page_id_or_vaddr - VIRTUAL_MEMORY_BASE;
-        uint32_t page_index = offset / PAGE_SIZE;
-        if (page_index >= NUM_PAGES) return -1;
-        return (int32_t)page_index;
-    }
 
-    // Otherwise assume it's already a page index
-    if (page_id_or_vaddr >= NUM_PAGES) return -1;
-    return (int32_t)page_id_or_vaddr;
+static int32_t translate_to_page_index(uint32_t vaddr) {
+    uint32_t offset = vaddr - VIRTUAL_MEMORY_BASE;
+    uint32_t page_index = offset / PAGE_SIZE;
+    if (page_index >= NUM_PAGES) return -1;
+    return (int32_t)page_index;
 }
 
 // Helper: convert internal page index to a client-facing virtual address
@@ -122,7 +106,7 @@ int32_t load_client_program_to_page_table(const char* filename) {
     printf("[USB] Loading client program (%ld bytes, %u pages)...\n", file_size, pages_needed);
     
     // Allocate pages in the page table
-    int32_t start_page = allocate_pages(sram_bitmap, NUM_PAGES, pages_needed);
+    int32_t start_page = allocate_pages(sram_bitmap, sizes_arr, pages_needed);
     if (start_page == -1) {
         fprintf(stderr, "[USB] Failed to allocate %u pages for client program\n", pages_needed);
         fclose(bin_file);
@@ -197,13 +181,12 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
     printf("[DEBUG] Header CMD RAW: raw=0x%08X\n", header->cmd);
     switch(header->cmd) {
         case PAGE_TABLE_READ: {
-            // Read 4 bytes for page identifier/virtual address
-            uint32_t pageIdRaw = 0;
-            memcpy(&pageIdRaw, payload, sizeof(uint32_t));
+            // Read 4 bytes for virtual address
+            uint32_t page_id = 0;
+            memcpy(&page_id, payload, sizeof(uint32_t));
 
-            int32_t pageIndex = translate_to_page_index(pageIdRaw);
-            if (pageIndex >= 0) {
-                printf("[CMD] Read Request for page (raw=0x%08X -> idx=%d). Sending data...\n", pageIdRaw, pageIndex);
+            if (page_id >= 0) {
+                printf("[CMD] Read Request for page_id=%u. Sending data...\n", page_id);
                 
                 CommunicationHeader tx_header = {
                     .mcu_id = header->mcu_id,
@@ -215,7 +198,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
                 uint8_t* tx_buffer = (uint8_t*)malloc(total_tx_size);
                 
                 memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
-                memcpy(tx_buffer + sizeof(CommunicationHeader), sram_frames[pageIndex], PAGE_SIZE);
+                memcpy(tx_buffer + sizeof(CommunicationHeader), sram_frames[page_id], PAGE_SIZE);
                 
                 int sent_bytes;
                 int r = libusb_bulk_transfer(dev_handle, EP_OUT,
@@ -229,7 +212,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
 
                 free(tx_buffer); // Free to prevent memory leaks
             } else {
-                fprintf(stderr, "[Error] Page identifier 0x%08X out of bounds.\n", pageIdRaw);
+                fprintf(stderr, "[Error] Page id: %u out of bounds.\n", page_id);
             }
             break;
         }
@@ -260,7 +243,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             uint32_t num_pages_needed = (requested_size + PAGE_SIZE - 1) / PAGE_SIZE;
             printf("[CMD] Alloc request of size: %u bytes (%u pages)\n", requested_size, num_pages_needed);
             
-            int32_t assigned_page_id = allocate_pages(sram_bitmap, NUM_PAGES, num_pages_needed);
+            int32_t assigned_page_id = allocate_pages(sram_bitmap, sizes_arr, num_pages_needed);
             
             if (assigned_page_id == -1) {
                 fprintf(stderr, "[Error] Memory too fragmented to allocate %u bytes.\n", requested_size);
@@ -295,6 +278,29 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             break;
         }
         
+        case PAGE_TABLE_FREE: {
+            uint32_t address_to_free;
+            memcpy(&address_to_free, payload, sizeof(uint32_t));
+
+            if(address_to_free != 0) {
+                free_pages(sram_bitmap, sizes_arr, address_to_free);
+                printf("[INFO] Freed memory at virtual address 0x%08X\n", address_to_free);
+            } else {
+                fprintf(stderr, "[ERROR] Address to free invalid: 0x%08X\n", address_to_free);
+            }
+            break;
+        }
+
+        /* MISC */
+        case LOG: {
+            char log_string[header->data_length];
+
+            memcpy(log_string, payload, header->data_length);
+            printf("[CLIENT LOG] %s", log_string);
+            break;
+        }
+
+        /* FILE */
         case FILE_OPEN: {
             // Read filename string (null-terminated)
             char filename[MAX_FILENAME_LENGTH];
