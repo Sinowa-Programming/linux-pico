@@ -33,16 +33,21 @@ static int32_t allocate_pages(uint32_t* bitarr, uint32_t* sizes_arr, uint32_t co
         
         // If no zero found, or the remaining space is too small, we are out of memory
         if (page_idx == -1 || (uint32_t)page_idx + count > NUM_PAGES) {
-            return 0;
+            return -1;
         }
+
+        bool block_is_free = true;
 
         // Verify that the free block has enough space for our requested allocation block
         for (uint32_t i = 1; i < count; i++) {
             if (get(bitarr, (uint32_t)page_idx + i)) {
                 page_idx = page_idx + i + 1;
-                continue; 
+                block_is_free = false;
+                break; 
             }
         }
+
+        if (!block_is_free) continue; // Restart the while loop with new page_idx
 
         // Allocate the block
         for (uint32_t i = 0; i < count; i++) {
@@ -50,8 +55,6 @@ static int32_t allocate_pages(uint32_t* bitarr, uint32_t* sizes_arr, uint32_t co
         }
         
         sizes_arr[page_idx] = count;
-        
-        // Translate the starting page index to a virtual address
         return page_idx;
     }
 

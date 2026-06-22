@@ -9,7 +9,7 @@
 #include "usb_handler.h"
 #include "file_functions.h"
 #include "client_program.h"
-
+#include "page_functions.h"
 
 uint8_t sram_frames[NUM_PAGES][PAGE_SIZE];
 uint32_t sizes_arr[NUM_PAGES] = {0};
@@ -37,14 +37,41 @@ static int32_t translate_to_page_index(uint32_t vaddr) {
     return (int32_t)page_index;
 }
 
-// Helper: convert internal page index to a client-facing virtual address
+
+// Convert internal page index to a client-facing virtual address
 static uint32_t page_index_to_virtual(uint32_t page_index) {
     return (uint32_t)(VIRTUAL_MEMORY_BASE + (page_index * PAGE_SIZE));
 }
 
+
+// Helper function to log page data to a file and console
+static void log_page_data(uint32_t page_id, const uint8_t *page_data, const char *operation) {
+    char filename[64];
+    // Create a clear filename, e.g., "page_0x20000000_WRITE.bin"
+    snprintf(filename, sizeof(filename), "page_0x%08X_%s.bin", page_id, operation);
+    
+    // Save to binary file
+    FILE *log_file = fopen(filename, "wb");
+    if (log_file) {
+        fwrite(page_data, 1, PAGE_SIZE, log_file);
+        fclose(log_file);
+        printf("[DEBUG] Saved full page data to %s\n", filename);
+    } else {
+        fprintf(stderr, "[Error] Failed to open %s for logging.\n", filename);
+    }
+
+    // Print a hex dump of the first 64 bytes to the console
+    printf("[DEBUG] Hex dump (first 64 bytes) of page 0x%08X:\n", page_id);
+    for (int i = 0; i < 64 && i < PAGE_SIZE; i++) {
+        printf("%02X ", page_data[i]);
+        if ((i + 1) % 16 == 0) printf("\n");
+    }
+    printf("\n");
+}
+
+
 void Start_Rp2350Host() {
     libusb_init(&ctx);
-    // Initialize sram_frames to 0
     memset(sram_frames, 0, sizeof(sram_frames));
 }
 
@@ -56,6 +83,7 @@ void Stop_Rp2350Host() {
     }
     libusb_exit(ctx);
 }
+
 
 bool connect() {
     dev_handle = libusb_open_device_with_vid_pid(ctx, VENDOR_ID, PRODUCT_ID);
@@ -102,7 +130,6 @@ int32_t load_client_program_to_page_table(const char* filename) {
     
     // Calculate number of pages needed
     uint32_t pages_needed = (file_size + PAGE_SIZE - 1) / PAGE_SIZE;
-    
     printf("[USB] Loading client program (%ld bytes, %u pages)...\n", file_size, pages_needed);
     
     // Allocate pages in the page table
@@ -165,6 +192,8 @@ bool start_client_program(uint32_t starting_addr)
         1000
     );
 
+    printf("[INFO] Client Program command sent with address: 0x%X\n", starting_addr);
+
     if (r != 0) {
         fprintf(stderr, "[Error] Failed to send start command: %s\n", 
                 libusb_error_name(r));
@@ -186,7 +215,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             memcpy(&page_id, payload, sizeof(uint32_t));
 
             if (page_id >= 0) {
-                printf("[CMD] Read Request for page_id=%u. Sending data...\n", page_id);
+                printf("[CMD] Read Request for page_id=%u. Virtual Address: 0x%08X. Sending data...\n", page_id, page_index_to_virtual(page_id));
                 
                 CommunicationHeader tx_header = {
                     .mcu_id = header->mcu_id,
@@ -208,7 +237,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
                 if (r != 0) {
                     fprintf(stderr, "[Error] Failed to send page data.\n");
                 }
-                printf("[INFO] Transmission Complete. \n");
+                printf("[INFO] Transmission Complete. Sent %d bytes\n", sent_bytes);
 
                 free(tx_buffer); // Free to prevent memory leaks
             } else {
@@ -225,9 +254,12 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             int32_t pageIndex = translate_to_page_index(pageIdRaw);
             if (pageIndex >= 0) {
                 // payload[0-3] is page id/raw address, payload[4...] is data
-                memcpy(sram_frames[pageIndex], &payload[4], PAGE_SIZE);
+                memcpy(sram_frames[pageIndex], payload + sizeof(uint32_t), PAGE_SIZE);
 
                 printf("[CMD] Saved %u bytes to page (raw=0x%08X -> idx=%d).\n", PAGE_SIZE, pageIdRaw, pageIndex);
+
+                const uint8_t *page_data = payload + sizeof(uint32_t);
+                log_page_data(pageIdRaw, page_data, "WRITE_FROM_MCU");
             } else {
                 fprintf(stderr, "[Error] Page identifier 0x%08X out of bounds.\n", pageIdRaw);
             }
@@ -293,10 +325,11 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
 
         /* MISC */
         case LOG: {
-            char log_string[header->data_length];
-
+            char *log_string = malloc(header->data_length + 1);
             memcpy(log_string, payload, header->data_length);
-            printf("[CLIENT LOG] %s", log_string);
+            log_string[header->data_length] = '\0';
+            printf("[CLIENT LOG] %s\n", log_string);
+            free(log_string);
             break;
         }
 
@@ -314,7 +347,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             CommunicationHeader tx_header = {
                 .mcu_id = header->mcu_id,
                 .cmd = FILE_OPEN,
-                .data_length = 0    // Ignored on the mcu( for now )
+                .data_length = sizeof(int32_t)
             };
 
             // Send back the file ID with header
@@ -358,12 +391,6 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             
             printf("[CMD] FILE_READ: offset=%u, length=%u, file_id=%u\n", 
                    file_read_header.file_offset, file_read_header.data_length, file_read_header.remote_file_id);
-            
-            CommunicationHeader tx_header = {
-                .mcu_id = header->mcu_id,
-                .cmd = FILE_OPEN,
-                .data_length = 0    // Ignored on the mcu( for now )
-            };
 
             // Allocate one buffer to hold header + file data
             uint32_t max_tx_size = sizeof(CommunicationHeader) + file_read_header.data_length;
@@ -381,6 +408,12 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
                                           tx_buffer + sizeof(CommunicationHeader));
             
             if (bytes_read > 0) {
+                CommunicationHeader tx_header = {
+                    .mcu_id = header->mcu_id,
+                    .cmd = FILE_READ,
+                    .data_length = bytes_read    // Ignored on the mcu( for now )
+                };
+                
                 // Prepend header to the successful file read
                 memcpy(tx_buffer, &tx_header, sizeof(CommunicationHeader));
                 uint32_t total_tx_size = sizeof(CommunicationHeader) + bytes_read;
@@ -392,6 +425,14 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
                 if (r != 0) {
                     fprintf(stderr, "[Error] Failed to send file data.\n");
                 }
+            } else {    // Send a data length of zero to prevent a spinlock on the pico's side.
+                CommunicationHeader tx_header = {
+                    .mcu_id = header->mcu_id,
+                    .cmd = FILE_READ,
+                    .data_length = 0
+                };
+                int sent_bytes;
+                libusb_bulk_transfer(dev_handle, EP_OUT, (unsigned char*)&tx_header, sizeof(tx_header), &sent_bytes, 0);
             }
             
             free(tx_buffer);
@@ -416,7 +457,7 @@ void processPayload(const CommunicationHeader *header, const uint8_t *payload) {
             
             write_file(file_write_header.remote_file_id, 
                       file_write_header.file_offset, 
-                      VIRTUAL_FILE_PAGE_SIZE,  // Write VIRTUAL_FILE_PAGE_SIZE bytes as sent by client
+                      file_write_header.data_length,  // Write VIRTUAL_FILE_PAGE_SIZE bytes as sent by client
                       file_data);
             break;
         }

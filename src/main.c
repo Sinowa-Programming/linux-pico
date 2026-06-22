@@ -14,7 +14,7 @@
 so the entry point is:
 #define CLIENT_PROGRAM_ENTRY_POINT 0x0000000020082628
 */
-#define CLIENT_PROGRAM_ENTRY_POINT 0x000000002008207c
+#define CLIENT_PROGRAM_ENTRY_POINT 0x0000000020082374
 
 int main(int argc, char* argv[]) {
     Start_Rp2350Host();
@@ -24,15 +24,16 @@ int main(int argc, char* argv[]) {
 
     // Load the client program from the specified file
     const char* client_program_file = (argc > 1) ? argv[1] : "pico_vpx.bin";
-    int32_t pages_loaded = load_client_program_to_page_table(client_program_file);
+    const uint32_t client_program_entry_point = (argc > 2) ? atoi(argv[2]) : CLIENT_PROGRAM_ENTRY_POINT;
 
+    int32_t pages_loaded = load_client_program_to_page_table(client_program_file);
     if (pages_loaded > 0) {
-        while(!start_client_program(CLIENT_PROGRAM_ENTRY_POINT));
+        while(!start_client_program(client_program_entry_point));
         printf("[MAIN] Client program loaded successfully\n");
-        runListener();
     } else {
         fprintf(stderr, "[MAIN] Failed to load client program\n");
     }
+    runListener();
 
     Stop_Rp2350Host();
     return 0;
